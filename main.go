@@ -81,7 +81,7 @@ const (
 
 	LimitMaxIPs     = 262144
 	LimitValidPairs = 10000
-	ChaosMaxNames   = 10000
+	ChaosMaxNames   = 5000
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
@@ -2806,26 +2806,70 @@ func enrichWithChaosDomain(ctx context.Context, allPairs []TargetPair, key strin
 			seenSNI[p.SNI] = struct{}{}
 		}
 	}
-	added := 0
-	chaosPairs := make([]TargetPair, 0, ChaosMaxNames)
+
+	// Chaos can return hundreds of thousands of raw names. Do not let the
+	// order of roots/results decide which names survive the global budget.
+	// Collect unique names first, then rank them and keep only the best TOP N.
+	chaosSeen := make(map[string]struct{}, ChaosMaxNames*16)
+	chaosNames := make([]string, 0, ChaosMaxNames*4)
 	for r := range out {
 		if r.err != nil {
 			continue
 		}
 		for _, d := range r.names {
-			if added >= ChaosMaxNames {
-				break
+			if d == "" {
+				continue
 			}
 			if _, ok := seenSNI[d]; ok {
 				continue
 			}
-			seenSNI[d] = struct{}{}
-			chaosPairs = append(chaosPairs, TargetPair{SNI: d, Evidence: Evidence{Direct: SourceChaos}})
-			added++
+			if _, ok := chaosSeen[d]; ok {
+				continue
+			}
+			chaosSeen[d] = struct{}{}
+			chaosNames = append(chaosNames, d)
 		}
-		if added >= ChaosMaxNames {
-			break
+	}
+
+	qualityScore := func(d string) int {
+		score := 0
+		parts := strings.Split(d, ".")
+		score += minInt(len(parts), 5)
+		if len(d) <= 48 {
+			score += 2
+		} else if len(d) > 80 {
+			score -= 2
 		}
+		switch classifyDomainQuality(d) {
+		case "Numeric":
+			score -= 30
+		case "DynDNS":
+			score -= 10
+		case "JunkTLD":
+			score -= 5
+		}
+		if strings.HasPrefix(d, "www.") || strings.HasPrefix(d, "mail.") || strings.HasPrefix(d, "api.") || strings.HasPrefix(d, "cdn.") || strings.HasPrefix(d, "ns") {
+			score += 2
+		}
+		return score
+	}
+	sort.SliceStable(chaosNames, func(i, j int) bool {
+		si := qualityScore(chaosNames[i])
+		sj := qualityScore(chaosNames[j])
+		if si != sj {
+			return si > sj
+		}
+		return chaosNames[i] < chaosNames[j]
+	})
+
+	limit := len(chaosNames)
+	if limit > ChaosMaxNames {
+		limit = ChaosMaxNames
+	}
+	chaosPairs := make([]TargetPair, 0, limit)
+	for _, d := range chaosNames[:limit] {
+		seenSNI[d] = struct{}{}
+		chaosPairs = append(chaosPairs, TargetPair{SNI: d, Evidence: Evidence{Direct: SourceChaos}})
 	}
 	return append(allPairs, chaosPairs...)
 }
