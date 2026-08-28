@@ -1,6 +1,6 @@
 package main
 
-// reality-scanner-active-v90: modular active scanner
+// reality-scanner-active-v91: modular active scanner
 
 import (
 	"bufio"
@@ -131,10 +131,24 @@ var (
 			ResponseHeaderTimeout: 1200 * time.Millisecond,
 		},
 	}
+	ipOSINTHTTPClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 2 * time.Second,
+		},
+	}
+	shodanOSINTSem  = make(chan struct{}, 10)
+	vtOSINTSem      = make(chan struct{}, 2)
+	shodanOSINTRate = ratelimit.New(10)
+	vtOSINTRate     = ratelimit.New(1)
 )
 
 type Config struct {
 	Workers           int
+	IPOSINTLimit      int
+	VTKey             string
 	MaxIPs            int
 	DNSWorkers        int
 	DNSQueryTimeoutMs int
@@ -163,6 +177,8 @@ const (
 	SourceSeed DomainSource = 1 << iota
 	SourcePTR
 	SourceDirectTLS
+	SourceShodan
+	SourceVirusTotalIP
 )
 
 func (s DomainSource) Has(flag DomainSource) bool { return s&flag != 0 }
@@ -2345,38 +2361,143 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand
 	return cand, nil
 }
 
-func getOSINTDomains(ip string) []string {
-	var domains []string
-	client := &http.Client{Timeout: 4 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/passive_dns", ip), nil)
-	if err != nil {
-		return nil
+func fetchShodanInternetDB(ctx context.Context, ip string, timeout time.Duration) ([]string, error) {
+	if err := shodanOSINTRate.Wait(ctx); err != nil {
+		return nil, err
 	}
-	// The endpoint is used only as a bounded SNI-enrichment fallback after direct TLS/PTR.
-	// Do not let an unavailable OSINT service block active discovery.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
-	resp, err := client.Do(req)
+	select {
+	case shodanOSINTSem <- struct{}{}:
+		defer func() { <-shodanOSINTSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://internetdb.shodan.io/"+url.QueryEscape(ip), nil)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "reality-scanner/1.0")
+	resp, err := ipOSINTHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return nil, fmt.Errorf("Shodan InternetDB HTTP %d", resp.StatusCode)
 	}
-	var res struct {
-		PassiveDNS []struct {
-			Hostname string `json:"hostname"`
-		} `json:"passive_dns"`
+	var payload struct {
+		Hostnames []string `json:"hostnames"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&res); err != nil {
-		return nil
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return nil, err
 	}
-	for _, r := range res.PassiveDNS {
-		if d := CleanDomain(r.Hostname); d != "" {
-			domains = append(domains, d)
+	out := make([]string, 0, len(payload.Hostnames))
+	for _, h := range payload.Hostnames {
+		if d := CleanDomain(h); d != "" {
+			out = append(out, d)
 		}
 	}
-	return uniqueStrings(domains)
+	return uniqueStrings(out), nil
+}
+
+func fetchVirusTotalIPResolutions(ctx context.Context, ip, key string, timeout time.Duration) ([]string, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, nil
+	}
+	if err := vtOSINTRate.Wait(ctx); err != nil {
+		return nil, err
+	}
+	select {
+	case vtOSINTSem <- struct{}{}:
+		defer func() { <-vtOSINTSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var out []string
+	cursor := ""
+	for page := 0; page < 3; page++ {
+		u := fmt.Sprintf("https://www.virustotal.com/api/v3/ip_addresses/%s/resolutions?limit=40", url.QueryEscape(ip))
+		if cursor != "" {
+			u += "&cursor=" + url.QueryEscape(cursor)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return out, err
+		}
+		req.Header.Set("User-Agent", "reality-scanner/1.0")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("x-apikey", key)
+		resp, err := ipOSINTHTTPClient.Do(req)
+		if err != nil {
+			return out, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return out, fmt.Errorf("VirusTotal HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var payload struct {
+			Data []struct {
+				Attributes struct {
+					HostName string `json:"host_name"`
+				} `json:"attributes"`
+			} `json:"data"`
+			Meta struct {
+				Cursor string `json:"cursor"`
+			} `json:"meta"`
+		}
+		err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
+		resp.Body.Close()
+		if err != nil {
+			return out, err
+		}
+		for _, item := range payload.Data {
+			if d := CleanDomain(item.Attributes.HostName); d != "" {
+				out = append(out, d)
+			}
+		}
+		if payload.Meta.Cursor == "" || payload.Meta.Cursor == cursor {
+			break
+		}
+		cursor = payload.Meta.Cursor
+	}
+	return uniqueStrings(out), nil
+}
+
+func getIPOSINTDomains(ctx context.Context, ip, vtKey string, timeout time.Duration) (map[string]DomainSource, []string) {
+	type result struct {
+		provider DomainSource
+		domains  []string
+	}
+	ch := make(chan result, 2)
+	go func() {
+		d, _ := fetchShodanInternetDB(ctx, ip, timeout)
+		ch <- result{provider: SourceShodan, domains: d}
+	}()
+	go func() {
+		d, _ := fetchVirusTotalIPResolutions(ctx, ip, vtKey, timeout)
+		ch <- result{provider: SourceVirusTotalIP, domains: d}
+	}()
+
+	sources := make(map[string]DomainSource)
+	var ordered []string
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		for _, d := range r.domains {
+			if _, seen := sources[d]; !seen {
+				ordered = append(ordered, d)
+			}
+			sources[d] |= r.provider
+		}
+	}
+	return sources, ordered
 }
 
 func extractDomainsFromTLS(ctx context.Context, ip, sni string, timeout time.Duration) ([]string, error) {
@@ -2417,7 +2538,7 @@ func extractDomainsFromTLS(ctx context.Context, ip, sni string, timeout time.Dur
 	return uniqueStrings(doms), nil
 }
 
-func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, pipeStats *PipelineStats, rtCaches *RuntimeCaches, cfg Config) []TargetPair {
+func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, pipeStats *PipelineStats, rtCaches *RuntimeCaches, cfg Config, allowIPOSINT bool) []TargetPair {
 	sourceMap := make(map[string]DomainSource)
 	addDomain := func(d string, src DomainSource) {
 		d = CleanDomain(d)
@@ -2457,16 +2578,18 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, pipeSt
 		}
 	}
 
-	// 3. Bounded passive enrichment. It never becomes a hard dependency of active scanning.
-	if len(sourceMap) < 5 {
-		for _, d := range getOSINTDomains(ip) {
-			addDomain(d, SourceSeed)
+	// 3. Bounded IP OSINT enrichment. Only a limited subset of sampled IPs uses
+	// external OSINT, and the two historically useful sources are queried in parallel.
+	if allowIPOSINT && len(sourceMap) < 5 {
+		srcByDomain, domains := getIPOSINTDomains(ctx, ip, cfg.VTKey, 6*time.Second)
+		for _, d := range domains {
+			src := srcByDomain[d]
+			addDomain(d, src)
 			cDoms, tlsErr := extractDomainsFromTLS(ctx, ip, d, timeout)
 			if tlsErr == nil && len(cDoms) > 0 {
 				for _, cd := range cDoms {
 					addDomain(cd, SourceDirectTLS)
 				}
-				break
 			}
 		}
 	}
@@ -2585,6 +2708,8 @@ func validateAndEnrich(cand *Candidate, pipeStats *PipelineStats) bool {
 	}
 	scoreDirect(SourcePTR, 3.0)
 	scoreDirect(SourceDirectTLS, 4.0)
+	scoreDirect(SourceShodan, 3.0)
+	scoreDirect(SourceVirusTotalIP, 4.0)
 	scoreDirect(SourceSeed, 1.0)
 
 	combinedSources := cand.Evidence.Combined()
@@ -2596,6 +2721,12 @@ func validateAndEnrich(cand *Candidate, pipeStats *PipelineStats) bool {
 		diversity++
 	}
 	if combinedSources.Has(SourceSeed) {
+		diversity++
+	}
+	if combinedSources.Has(SourceShodan) {
+		diversity++
+	}
+	if combinedSources.Has(SourceVirusTotalIP) {
 		diversity++
 	}
 	if diversity >= 2 {
@@ -2682,10 +2813,22 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 
 	if resumeStage == "" {
-		progressf("[*] STAGE A: Active certificate/SNI discovery (Direct TLS + resilient PTR)...\n")
+		progressf("[*] STAGE A: Active certificate/SNI discovery (Direct TLS + resilient PTR + IP OSINT)...\n")
 		allPairs = make([]TargetPair, 0, len(sampledIPs))
+		ipOSINTLimit := cfg.IPOSINTLimit
+		if ipOSINTLimit <= 0 || ipOSINTLimit > len(sampledIPs) {
+			ipOSINTLimit = len(sampledIPs)
+		}
+		ipOSINTAllowed := make(map[string]struct{}, ipOSINTLimit)
+		osintIPs := append([]string(nil), sampledIPs...)
+		osintRand := rand.New(rand.NewSource(cfg.Seed ^ int64(0x49504f53494e54)))
+		osintRand.Shuffle(len(osintIPs), func(i, j int) { osintIPs[i], osintIPs[j] = osintIPs[j], osintIPs[i] })
+		for _, ip := range osintIPs[:ipOSINTLimit] {
+			ipOSINTAllowed[ip] = struct{}{}
+		}
 		for _, pairs := range discovery.Map(ctx, sampledIPs, minInt(cfg.Workers, len(sampledIPs)), func(jobCtx context.Context, ip string) []TargetPair {
-			return activeProbeIP(jobCtx, ip, time.Duration(cfg.TLSTimeoutMs)*time.Millisecond, pipeStats, rtCaches, cfg)
+			_, allow := ipOSINTAllowed[ip]
+			return activeProbeIP(jobCtx, ip, time.Duration(cfg.TLSTimeoutMs)*time.Millisecond, pipeStats, rtCaches, cfg, allow)
 		}) {
 			allPairs = append(allPairs, pairs...)
 		}
@@ -2700,7 +2843,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	progressf("[+] Stage A завершён. Уникальных SNI: %d | Пар IP+SNI: %d\n", len(uniqueDomains), len(allPairs))
 	if cfg.Checkpoint != "" && resumeStage == "" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v87", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v91", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
 	}
 	if len(allPairs) == 0 {
 		activePTRStats(rtCaches, pipeStats)
@@ -2815,7 +2958,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	}
 	if cfg.Checkpoint != "" && resumeStage != "D" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v87", Stage: "D", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs, StageD: validPairs})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v91", Stage: "D", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs, StageD: validPairs})
 	}
 	progressf("[*] STAGE E: Active HTTP/2 + TLS validation (%d targets)...\n", len(validPairs))
 	var candidates []Candidate
@@ -3288,7 +3431,7 @@ func saveCheckpoint(path string, cp checkpointData) error {
 }
 
 func checkpointMatches(cp checkpointData, cfg Config, sampledIPs []string) bool {
-	if cp.Version != "v87" || cp.TargetIP != cfg.TargetIP || cp.TargetASN != cfg.TargetASN || cp.TargetCountry != cfg.TargetCountry {
+	if cp.Version != "v91" || cp.TargetIP != cfg.TargetIP || cp.TargetASN != cfg.TargetASN || cp.TargetCountry != cfg.TargetCountry {
 		return false
 	}
 	if len(cp.SampledIPs) != len(sampledIPs) {
@@ -3312,7 +3455,7 @@ func loadCheckpoint(path string) (checkpointData, error) {
 	if err := json.NewDecoder(f).Decode(&cp); err != nil {
 		return cp, err
 	}
-	if cp.Version != "v87" {
+	if cp.Version != "v91" {
 		return cp, fmt.Errorf("unsupported checkpoint version %q", cp.Version)
 	}
 	return cp, nil
@@ -3324,6 +3467,8 @@ func main() {
 
 	cfg := Config{
 		Workers:           30,
+		IPOSINTLimit:      256,
+		VTKey:             "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5",
 		MaxIPs:            LimitMaxIPs,
 		DNSWorkers:        32,
 		DNSQueryTimeoutMs: int(DNSQueryTimeoutDefault.Milliseconds()),
@@ -3337,6 +3482,7 @@ func main() {
 	}
 
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
+	flag.IntVar(&cfg.IPOSINTLimit, "ip-osint-limit", 256, "Maximum sampled IPs for IP OSINT")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP VPS для определения ASN, страны и ECS")
 	flag.Float64Var(&cfg.Rate, "rate", 0, "New TCP/TLS probe rate per second; 0=unlimited")
 	flag.BoolVar(&cfg.JSON, "json", false, "Emit JSON Lines instead of the text table")
@@ -3437,7 +3583,7 @@ func main() {
 
 	results := RunPipeline(ctx, cfg, sampledIPs, scanRanges)
 	if cfg.Checkpoint != "" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v87", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v91", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
 	}
 	if len(results) == 0 {
 		progressln("\n[-] Подходящих Reality-feasible HTTP/2 целей не найдено.")
