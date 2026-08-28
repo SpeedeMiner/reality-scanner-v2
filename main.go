@@ -39,6 +39,7 @@ import (
 	discovery "reality-scanner/internal/discovery"
 	output "reality-scanner/internal/output"
 	ratelimit "reality-scanner/internal/ratelimit"
+	scanning "reality-scanner/internal/scanning"
 )
 
 var progressJSON bool
@@ -171,6 +172,15 @@ func (e Evidence) Combined() DomainSource { return e.Direct | e.Inherited }
 type Evidence struct {
 	Direct    DomainSource
 	Inherited DomainSource
+}
+
+func (t Timings) TotalProbeLatency() time.Duration { return t.TCP + t.TLS + t.H2Headers }
+
+type Timings struct {
+	TCP          time.Duration
+	TLS          time.Duration
+	H2FirstFrame time.Duration
+	H2Headers    time.Duration
 }
 
 func (t Timings) TotalProbeLatency() time.Duration { return t.TCP + t.TLS + t.H2Headers }
