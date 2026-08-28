@@ -512,6 +512,7 @@ type RuntimeCaches struct {
 	DNSConsecutiveFailures map[string]int
 	DNSDisabledForRun      map[string]bool
 	DNSHealthWindows       map[string]*DNSHealthWindow
+	DNSInFlight            map[string]int
 
 	// It prevents one root cancellation from aborting a request shared by other roots.
 
@@ -535,6 +536,7 @@ func NewRuntimeCaches() *RuntimeCaches {
 		DNSConsecutiveFailures: make(map[string]int),
 		DNSDisabledForRun:      make(map[string]bool),
 		DNSHealthWindows:       make(map[string]*DNSHealthWindow),
+		DNSInFlight:            make(map[string]int),
 	}
 }
 
@@ -563,46 +565,88 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	r.DNSStatsMu.Lock()
 	defer r.DNSStatsMu.Unlock()
 
+	type resolverChoice struct {
+		name   string
+		score  float64
+		offset int
+	}
+	choicesHealthy := make([]resolverChoice, 0, len(resolvers))
+	choicesDegraded := make([]resolverChoice, 0, len(resolvers))
 	start := r.DNSRoundRobinCursor % len(resolvers)
 	if start < 0 {
 		start = 0
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	var healthy, degraded []string
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
 		if r.DNSDisabledForRun[resolver] {
 			continue
 		}
-		until := r.DNSCooldownUntil[resolver]
-		if !until.IsZero() && now.Before(until) {
+		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
 			continue
 		}
+
+		st := r.DNSResolverStats[resolver]
+		rtt := 250.0
+		attempts := 0.0
+		if st != nil {
+			if st.RTTMs > 0 {
+				rtt = st.RTTMs
+			}
+			attempts = float64(st.Attempts)
+		}
+		inflight := float64(r.DNSInFlight[resolver])
+		// Lower is better. In-flight work dominates so a resolver cannot become
+		// a hot spot merely because it has a good historical RTT. Recent attempt
+		// count is a smaller balancing term; RTT is only a tie-breaker/quality
+		// signal. The offset preserves deterministic spreading when scores tie.
+		score := inflight*2000.0 + attempts*0.02 + rtt
+		choice := resolverChoice{name: resolver, score: score, offset: i}
 		switch dnsHealthState(r.DNSHealthWindows[resolver]) {
 		case "degraded", "cooldown":
-			degraded = append(degraded, resolver)
+			choicesDegraded = append(choicesDegraded, choice)
 		default:
-			healthy = append(healthy, resolver)
+			choicesHealthy = append(choicesHealthy, choice)
 		}
 	}
 
-	if len(healthy)+len(degraded) == 0 {
-		// Do not immediately reuse a resolver that is still in cooldown. Returning
-		// nil lets the caller use its bounded fallback transports instead of
-		// defeating the cooldown and recreating the failure spiral.
+	less := func(a, b resolverChoice) bool {
+		if a.score == b.score {
+			return a.offset < b.offset
+		}
+		return a.score < b.score
+	}
+	sort.SliceStable(choicesHealthy, func(i, j int) bool { return less(choicesHealthy[i], choicesHealthy[j]) })
+	sort.SliceStable(choicesDegraded, func(i, j int) bool { return less(choicesDegraded[i], choicesDegraded[j]) })
+
+	if len(choicesHealthy)+len(choicesDegraded) == 0 {
 		return nil
 	}
-
-	// Prefer healthy resolvers exclusively while enough healthy capacity exists.
-	// The old interleaving policy deliberately injected degraded resolvers into
-	// every lookup, which caused avoidable timeout amplification even when many
-	// healthy resolvers were available. Degraded resolvers remain a bounded
-	// reserve and are used only after the healthy set is exhausted.
-	order := make([]string, 0, len(healthy)+len(degraded))
-	order = append(order, healthy...)
-	order = append(order, degraded...)
+	order := make([]string, 0, len(choicesHealthy)+len(choicesDegraded))
+	for _, c := range choicesHealthy {
+		order = append(order, c.name)
+	}
+	for _, c := range choicesDegraded {
+		order = append(order, c.name)
+	}
 	return order
+}
+
+func (r *RuntimeCaches) beginDNSQuery(resolver string) {
+	r.DNSStatsMu.Lock()
+	r.DNSInFlight[resolver]++
+	r.DNSStatsMu.Unlock()
+}
+
+func (r *RuntimeCaches) endDNSQuery(resolver string) {
+	r.DNSStatsMu.Lock()
+	if n := r.DNSInFlight[resolver]; n <= 1 {
+		delete(r.DNSInFlight, resolver)
+	} else {
+		r.DNSInFlight[resolver] = n - 1
+	}
+	r.DNSStatsMu.Unlock()
 }
 
 func (r *RuntimeCaches) recordDNSHealthLocked(resolver string, transportFailure bool) float64 {
@@ -980,6 +1024,7 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 				}
 				tcpCancel()
 			}
+			rtCaches.endDNSQuery(resolver)
 			rtCaches.recordDNSResult(resolver, err, time.Since(started), len(ips))
 			cancel()
 
@@ -1096,6 +1141,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	for _, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
+		rtCaches.beginDNSQuery(resolver)
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 
 		// TCP is only a truncation fallback. A UDP timeout must not spend another
@@ -1228,6 +1274,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	for _, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
+		rtCaches.beginDNSQuery(resolver)
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
 		if errors.Is(err, ErrDNSTruncated) {
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, resolverTimeout); tcpErr == nil {
@@ -1236,6 +1283,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 				err = tcpErr
 			}
 		}
+		rtCaches.endDNSQuery(resolver)
 		rtCaches.recordDNSResult(resolver, err, time.Since(started), 0)
 
 		if err == nil {
