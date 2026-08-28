@@ -1,6 +1,6 @@
 package main
 
-// reality-scanner-active-v87: modular active scanner
+// reality-scanner-active-v90: modular active scanner
 
 import (
 	"bufio"
@@ -480,20 +480,14 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 		return nil
 	}
 
-	// Keep the scheduler fair. Healthy nodes get the first position of each
-	// pair, but degraded nodes remain in rotation instead of being starved or
-	// monopolizing the entire run.
+	// Prefer healthy resolvers exclusively while enough healthy capacity exists.
+	// The old interleaving policy deliberately injected degraded resolvers into
+	// every lookup, which caused avoidable timeout amplification even when many
+	// healthy resolvers were available. Degraded resolvers remain a bounded
+	// reserve and are used only after the healthy set is exhausted.
 	order := make([]string, 0, len(healthy)+len(degraded))
-	for hi, di := 0, 0; hi < len(healthy) || di < len(degraded); {
-		if hi < len(healthy) {
-			order = append(order, healthy[hi])
-			hi++
-		}
-		if di < len(degraded) {
-			order = append(order, degraded[di])
-			di++
-		}
-	}
+	order = append(order, healthy...)
+	order = append(order, degraded...)
 	return order
 }
 
@@ -1302,68 +1296,102 @@ func resolveASystem(ctx context.Context, domain string) ([]string, error) {
 }
 
 func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]string, error) {
+	if timeout <= 0 {
+		timeout = 1200 * time.Millisecond
+	}
+	budgetCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	endpoints := []string{
 		"https://dns.google/resolve?name=" + url.QueryEscape(rev) + "&type=PTR",
 		"https://cloudflare-dns.com/dns-query?name=" + url.QueryEscape(rev) + "&type=PTR",
 	}
-	client := dnsDoHHTTPClient
-	var lastErr error
+
+	type result struct {
+		names []string
+		err   error
+		nx    bool
+	}
+	results := make(chan result, len(endpoints))
 	for _, endpoint := range endpoints {
-		reqCtx, cancel := context.WithTimeout(ctx, timeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Accept", "application/dns-json")
-		req.Header.Set("User-Agent", "reality-scanner/1.0")
-		resp, err := client.Do(req)
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			cancel()
-			lastErr = fmt.Errorf("PTR DoH HTTP status=%d", resp.StatusCode)
-			continue
-		}
-		var payload struct {
-			Status int `json:"Status"`
-			Answer []struct {
-				Type int    `json:"type"`
-				Data string `json:"data"`
-			} `json:"Answer"`
-		}
-		decodeErr := func() error {
+		ep := endpoint
+		go func() {
+			reqCtx, reqCancel := context.WithCancel(budgetCtx)
+			defer reqCancel()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, ep, nil)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			req.Header.Set("Accept", "application/dns-json")
+			req.Header.Set("User-Agent", "reality-scanner/1.0")
+			resp, err := dnsDoHHTTPClient.Do(req)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
 			defer resp.Body.Close()
-			return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				results <- result{err: fmt.Errorf("PTR DoH HTTP status=%d", resp.StatusCode)}
+				return
+			}
+
+			var payload struct {
+				Status int `json:"Status"`
+				Answer []struct {
+					Type int    `json:"type"`
+					Data string `json:"data"`
+				} `json:"Answer"`
+			}
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+				results <- result{err: err}
+				return
+			}
+			if payload.Status == 3 {
+				results <- result{nx: true}
+				return
+			}
+			if payload.Status != 0 {
+				results <- result{err: fmt.Errorf("DoH DNS status=%d", payload.Status)}
+				return
+			}
+
+			names := make([]string, 0, len(payload.Answer))
+			for _, answer := range payload.Answer {
+				if answer.Type != 12 {
+					continue
+				}
+				if d := CleanDomain(strings.TrimSuffix(strings.TrimSpace(answer.Data), ".")); d != "" {
+					names = append(names, d)
+				}
+			}
+			results <- result{names: uniqueStrings(names)}
 		}()
-		cancel()
-		if decodeErr != nil {
-			lastErr = decodeErr
-			continue
-		}
-		if payload.Status == 3 {
-			return nil, ErrDNSNXDomain
-		}
-		if payload.Status != 0 {
-			lastErr = fmt.Errorf("DoH DNS status=%d", payload.Status)
-			continue
-		}
-		var names []string
-		for _, answer := range payload.Answer {
-			if answer.Type != 12 {
-				continue
+	}
+
+	var lastErr error
+	nxCount := 0
+	for remaining := len(endpoints); remaining > 0; remaining-- {
+		select {
+		case r := <-results:
+			if len(r.names) > 0 {
+				return r.names, nil
 			}
-			if d := CleanDomain(strings.TrimSuffix(strings.TrimSpace(answer.Data), ".")); d != "" {
-				names = append(names, d)
+			if r.nx {
+				nxCount++
+			} else if r.err != nil {
+				lastErr = r.err
 			}
+		case <-budgetCtx.Done():
+			if lastErr == nil {
+				lastErr = budgetCtx.Err()
+			}
+			return nil, lastErr
 		}
-		return uniqueStrings(names), nil
+	}
+	if nxCount == len(endpoints) {
+		return nil, ErrDNSNXDomain
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("PTR DoH fallback failed")
