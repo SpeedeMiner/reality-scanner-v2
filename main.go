@@ -34,6 +34,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/singleflight"
 
 	discovery "reality-scanner/internal/discovery"
@@ -188,6 +189,7 @@ const (
 	SourceDirectTLS
 	SourceShodan
 	SourceVirusTotalIP
+	SourceChaos
 )
 
 func (s DomainSource) Has(flag DomainSource) bool { return s&flag != 0 }
