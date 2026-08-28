@@ -81,7 +81,7 @@ const (
 
 	LimitMaxIPs     = 262144
 	LimitValidPairs = 10000
-	ChaosMaxNames   = 5000
+	ChaosMaxNames   = 2000
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
@@ -2743,24 +2743,39 @@ func enrichWithChaosDomain(ctx context.Context, allPairs []TargetPair, key strin
 		rootSources[root] |= p.Evidence.Combined()
 		rootScore[root]++
 	}
-	roots := make([]string, 0, len(rootScore))
-	for root := range rootScore {
-		roots = append(roots, root)
+
+	// Chaos is an enrichment source, not a second full discovery pass. Prefer
+	// roots for which the active sources produced little evidence, and skip roots
+	// that already have multiple independent/high-quality signals.
+	type rootCandidate struct {
+		root  string
+		score int
 	}
-	sort.Slice(roots, func(i, j int) bool {
-		sourceWeight := func(src DomainSource) int {
-			w := rankRootSources(src)
-			return w
+	rootCandidates := make([]rootCandidate, 0, len(rootScore))
+	for root, count := range rootScore {
+		srcWeight := rankRootSources(rootSources[root])
+		weakness := 12 - minInt(srcWeight, 12)
+		if count > 4 {
+			weakness -= minInt(count-4, 6)
 		}
-		wi := rootScore[roots[i]]*2 + sourceWeight(rootSources[roots[i]])
-		wj := rootScore[roots[j]]*2 + sourceWeight(rootSources[roots[j]])
-		if wi != wj {
-			return wi > wj
+		// Strong multi-source roots are deliberately deprioritized.
+		if rootSources[root].Has(SourceDirectTLS) && rootSources[root].Has(SourcePTR) && srcWeight >= 12 {
+			weakness -= 4
 		}
-		return roots[i] < roots[j]
+		if weakness <= 0 {
+			continue
+		}
+		rootCandidates = append(rootCandidates, rootCandidate{root: root, score: weakness*10 - count})
+	}
+	sort.Slice(rootCandidates, func(i, j int) bool {
+		if rootCandidates[i].score != rootCandidates[j].score {
+			return rootCandidates[i].score > rootCandidates[j].score
+		}
+		return rootCandidates[i].root < rootCandidates[j].root
 	})
-	if len(roots) > 100 {
-		roots = roots[:100]
+	roots := make([]string, 0, minInt(len(rootCandidates), 50))
+	for i := 0; i < len(rootCandidates) && i < 50; i++ {
+		roots = append(roots, rootCandidates[i].root)
 	}
 	pipeStats.mu.Lock()
 	pipeStats.ChaosRootsQueried = len(roots)
@@ -2839,6 +2854,11 @@ func enrichWithChaosDomain(ctx context.Context, allPairs []TargetPair, key strin
 			score += 2
 		} else if len(d) > 80 {
 			score -= 2
+		}
+		if root, err := publicsuffix.EffectiveTLDPlusOne(d); err == nil {
+			if src := rootSources[root]; src != 0 {
+				score += minInt(rankRootSources(src), 4)
+			}
 		}
 		switch classifyDomainQuality(d) {
 		case "Numeric":
@@ -3234,7 +3254,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	progressf("[+] Stage A Direct/PTR/IP-OSINT завершён. Уникальных SNI: %d | Пар IP+SNI: %d\n", len(uniqueDomains), len(allPairs))
 	if strings.TrimSpace(cfg.ChaosKey) != "" {
 		allPairs = enrichWithChaosDomain(ctx, allPairs, cfg.ChaosKey, pipeStats)
-		progressf("[+] Chaos Domain enrichment: roots=%d | attempts=%d | success=%d | names=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames)
+		progressf("[+] Chaos Domain enrichment: roots=%d | attempts=%d | success=%d | raw-names=%d | selected-max=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames, ChaosMaxNames)
 	}
 	if cfg.Checkpoint != "" && resumeStage == "" {
 		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
