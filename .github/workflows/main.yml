@@ -21,11 +21,11 @@ jobs:
         go mod init reality-scanner
         
         # Скачиваем основные зависимости явно (для надежности перед tidy)
-        github.com/refraction-networking/utls
-        github.com/miekg/dns
-        golang.org/x/net/http2
-        golang.org/x/net/publicsuffix
-        golang.org/x/sync/singleflight
+        go get github.com/refraction-networking/utls
+        go get github.com/miekg/dns
+        go get golang.org/x/net/http2
+        go get golang.org/x/net/publicsuffix
+        go get golang.org/x/sync/singleflight
         go mod tidy
         
         # Сборка только для Windows. Флаги -s -w уменьшают размер exe файла.
