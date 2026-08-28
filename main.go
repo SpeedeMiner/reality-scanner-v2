@@ -174,8 +174,6 @@ type Evidence struct {
 	Inherited DomainSource
 }
 
-func (t Timings) TotalProbeLatency() time.Duration { return t.TCP + t.TLS + t.H2Headers }
-
 type Timings struct {
 	TCP          time.Duration
 	TLS          time.Duration
