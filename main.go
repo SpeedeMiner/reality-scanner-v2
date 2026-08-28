@@ -60,6 +60,13 @@ func progressln(args ...any) {
 	fmt.Fprintln(w, args...)
 }
 
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+}
+
 // ================= CONFIG & CONSTANTS =================
 
 const (
@@ -186,6 +193,29 @@ const (
 func (s DomainSource) Has(flag DomainSource) bool { return s&flag != 0 }
 
 func (e Evidence) Combined() DomainSource { return e.Direct | e.Inherited }
+
+func rankRootSources(s DomainSource) int {
+	score := 0
+	if s.Has(SourcePTR) {
+		score += 10
+	}
+	if s.Has(SourceShodan) {
+		score += 8
+	}
+	if s.Has(SourceVirusTotalIP) {
+		score += 8
+	}
+	if s.Has(SourceDirectTLS) {
+		score += 6
+	}
+	if s.Has(SourceSeed) {
+		score += 5
+	}
+	if s.Has(SourceChaos) {
+		score += 5
+	}
+	return score
+}
 
 type Evidence struct {
 	Direct    DomainSource
@@ -317,6 +347,18 @@ type PipelineStats struct {
 	DNSTargetDomains      int
 	DNSValidPairs         int
 	PairLimitDrops        int
+	IPOSINTIPsSelected    int
+	IPOSINTSelectedNames  int
+	IPOSINTShodanAttempts int
+	IPOSINTShodanSuccess  int
+	IPOSINTShodanNames    int
+	IPOSINTVTAttempts     int
+	IPOSINTVTSuccess      int
+	IPOSINTVTNames        int
+	ChaosRootsQueried     int
+	ChaosAttempts         int
+	ChaosSuccess          int
+	ChaosNames            int
 
 	TCPConnected int
 	TCPTimeouts  int
