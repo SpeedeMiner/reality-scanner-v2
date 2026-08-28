@@ -1,6 +1,6 @@
 package main
 
-// reality-scanner-active-v91: modular active scanner
+// reality-scanner-active-v92: modular active scanner
 
 import (
 	"bufio"
@@ -73,6 +73,7 @@ const (
 
 	LimitMaxIPs     = 262144
 	LimitValidPairs = 10000
+	ChaosMaxNames   = 10000
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
@@ -149,6 +150,7 @@ type Config struct {
 	Workers           int
 	IPOSINTLimit      int
 	VTKey             string
+	ChaosKey          string
 	MaxIPs            int
 	DNSWorkers        int
 	DNSQueryTimeoutMs int
@@ -2471,33 +2473,232 @@ func fetchVirusTotalIPResolutions(ctx context.Context, ip, key string, timeout t
 	return uniqueStrings(out), nil
 }
 
-func getIPOSINTDomains(ctx context.Context, ip, vtKey string, timeout time.Duration) (map[string]DomainSource, []string) {
+func getIPOSINTDomains(ctx context.Context, ip, vtKey string, timeout time.Duration, pipeStats *PipelineStats) (map[string]DomainSource, []string) {
 	type result struct {
 		provider DomainSource
 		domains  []string
+		err      error
 	}
 	ch := make(chan result, 2)
 	go func() {
-		d, _ := fetchShodanInternetDB(ctx, ip, timeout)
-		ch <- result{provider: SourceShodan, domains: d}
+		pipeStats.mu.Lock()
+		pipeStats.IPOSINTShodanAttempts++
+		pipeStats.mu.Unlock()
+		d, err := fetchShodanInternetDB(ctx, ip, timeout)
+		pipeStats.mu.Lock()
+		if err == nil {
+			pipeStats.IPOSINTShodanSuccess++
+			pipeStats.IPOSINTShodanNames += len(d)
+		}
+		pipeStats.mu.Unlock()
+		ch <- result{provider: SourceShodan, domains: d, err: err}
 	}()
 	go func() {
-		d, _ := fetchVirusTotalIPResolutions(ctx, ip, vtKey, timeout)
-		ch <- result{provider: SourceVirusTotalIP, domains: d}
+		if strings.TrimSpace(vtKey) == "" {
+			ch <- result{provider: SourceVirusTotalIP}
+			return
+		}
+		pipeStats.mu.Lock()
+		pipeStats.IPOSINTVTAttempts++
+		pipeStats.mu.Unlock()
+		d, err := fetchVirusTotalIPResolutions(ctx, ip, vtKey, timeout)
+		pipeStats.mu.Lock()
+		if err == nil {
+			pipeStats.IPOSINTVTSuccess++
+			pipeStats.IPOSINTVTNames += len(d)
+		}
+		pipeStats.mu.Unlock()
+		ch <- result{provider: SourceVirusTotalIP, domains: d, err: err}
 	}()
 
 	sources := make(map[string]DomainSource)
-	var ordered []string
 	for i := 0; i < 2; i++ {
 		r := <-ch
 		for _, d := range r.domains {
-			if _, seen := sources[d]; !seen {
-				ordered = append(ordered, d)
-			}
 			sources[d] |= r.provider
 		}
 	}
+
+	ordered := make([]string, 0, len(sources))
+	for d := range sources {
+		ordered = append(ordered, d)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		sourceWeight := func(src DomainSource) int {
+			w := 0
+			if src.Has(SourceShodan) {
+				w += 3
+			}
+			if src.Has(SourceVirusTotalIP) {
+				w += 4
+			}
+			return w
+		}
+		qualityPenalty := func(d string) int {
+			switch classifyDomainQuality(d) {
+			case "Numeric":
+				return 30
+			case "DynDNS":
+				return 20
+			case "JunkTLD":
+				return 5
+			default:
+				return 0
+			}
+		}
+		wi := sourceWeight(sources[ordered[i]]) - qualityPenalty(ordered[i])
+		wj := sourceWeight(sources[ordered[j]]) - qualityPenalty(ordered[j])
+		if wi != wj {
+			return wi > wj
+		}
+		return ordered[i] < ordered[j]
+	})
 	return sources, ordered
+}
+
+func fetchChaosDomain(ctx context.Context, root, key string, timeout time.Duration) ([]string, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://dns.projectdiscovery.io/dns/%s/subdomains", url.QueryEscape(root)), nil)
+	if err != nil {
+		return nil, err
+	}
+	setBrowserHeaders(req)
+	req.Header.Set("Authorization", key)
+	resp, err := ipOSINTHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("Chaos HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		Subdomains []string `json:"subdomains"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(payload.Subdomains))
+	for _, sub := range payload.Subdomains {
+		sub = strings.TrimSpace(strings.TrimSuffix(sub, "."))
+		if sub == "" {
+			continue
+		}
+		full := sub
+		if !strings.Contains(sub, ".") || !strings.HasSuffix(sub, "."+root) {
+			full = sub + "." + root
+		}
+		if d := CleanDomain(full); d != "" {
+			out = append(out, d)
+		}
+	}
+	return uniqueStrings(out), nil
+}
+
+func enrichWithChaosDomain(ctx context.Context, allPairs []TargetPair, key string, pipeStats *PipelineStats) []TargetPair {
+	if strings.TrimSpace(key) == "" || len(allPairs) == 0 {
+		return allPairs
+	}
+	rootScore := make(map[string]int)
+	rootSources := make(map[string]DomainSource)
+	for _, p := range allPairs {
+		root, err := publicsuffix.EffectiveTLDPlusOne(p.SNI)
+		if err != nil || root == "" {
+			continue
+		}
+		rootSources[root] |= p.Evidence.Combined()
+		rootScore[root]++
+	}
+	roots := make([]string, 0, len(rootScore))
+	for root := range rootScore {
+		roots = append(roots, root)
+	}
+	sort.Slice(roots, func(i, j int) bool {
+		sourceWeight := func(src DomainSource) int {
+			w := rankRootSources(src)
+			return w
+		}
+		wi := rootScore[roots[i]]*2 + sourceWeight(rootSources[roots[i]])
+		wj := rootScore[roots[j]]*2 + sourceWeight(rootSources[roots[j]])
+		if wi != wj {
+			return wi > wj
+		}
+		return roots[i] < roots[j]
+	})
+	if len(roots) > 100 {
+		roots = roots[:100]
+	}
+	pipeStats.mu.Lock()
+	pipeStats.ChaosRootsQueried = len(roots)
+	pipeStats.mu.Unlock()
+	type res struct {
+		root  string
+		names []string
+		err   error
+	}
+	jobs := make(chan string, len(roots))
+	out := make(chan res, len(roots))
+	workers := minInt(2, len(roots))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for root := range jobs {
+				pipeStats.mu.Lock()
+				pipeStats.ChaosAttempts++
+				pipeStats.mu.Unlock()
+				names, err := fetchChaosDomain(ctx, root, key, 8*time.Second)
+				if err == nil {
+					pipeStats.mu.Lock()
+					pipeStats.ChaosSuccess++
+					pipeStats.ChaosNames += len(names)
+					pipeStats.mu.Unlock()
+				}
+				out <- res{root: root, names: names, err: err}
+			}
+		}()
+	}
+	for _, root := range roots {
+		jobs <- root
+	}
+	close(jobs)
+	wg.Wait()
+	close(out)
+
+	seenSNI := make(map[string]struct{}, len(allPairs)+ChaosMaxNames)
+	for _, p := range allPairs {
+		if p.SNI != "" {
+			seenSNI[p.SNI] = struct{}{}
+		}
+	}
+	added := 0
+	chaosPairs := make([]TargetPair, 0, ChaosMaxNames)
+	for r := range out {
+		if r.err != nil {
+			continue
+		}
+		for _, d := range r.names {
+			if added >= ChaosMaxNames {
+				break
+			}
+			if _, ok := seenSNI[d]; ok {
+				continue
+			}
+			seenSNI[d] = struct{}{}
+			chaosPairs = append(chaosPairs, TargetPair{SNI: d, Evidence: Evidence{Direct: SourceChaos}})
+			added++
+		}
+		if added >= ChaosMaxNames {
+			break
+		}
+	}
+	return append(allPairs, chaosPairs...)
 }
 
 func extractDomainsFromTLS(ctx context.Context, ip, sni string, timeout time.Duration) ([]string, error) {
@@ -2581,7 +2782,13 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, pipeSt
 	// 3. Bounded IP OSINT enrichment. Only a limited subset of sampled IPs uses
 	// external OSINT, and the two historically useful sources are queried in parallel.
 	if allowIPOSINT && len(sourceMap) < 5 {
-		srcByDomain, domains := getIPOSINTDomains(ctx, ip, cfg.VTKey, 6*time.Second)
+		srcByDomain, domains := getIPOSINTDomains(ctx, ip, cfg.VTKey, 6*time.Second, pipeStats)
+		if len(domains) > 20 {
+			domains = domains[:20]
+		}
+		pipeStats.mu.Lock()
+		pipeStats.IPOSINTSelectedNames += len(domains)
+		pipeStats.mu.Unlock()
 		for _, d := range domains {
 			src := srcByDomain[d]
 			addDomain(d, src)
@@ -2710,6 +2917,7 @@ func validateAndEnrich(cand *Candidate, pipeStats *PipelineStats) bool {
 	scoreDirect(SourceDirectTLS, 4.0)
 	scoreDirect(SourceShodan, 3.0)
 	scoreDirect(SourceVirusTotalIP, 4.0)
+	scoreDirect(SourceChaos, 4.0)
 	scoreDirect(SourceSeed, 1.0)
 
 	combinedSources := cand.Evidence.Combined()
@@ -2727,6 +2935,9 @@ func validateAndEnrich(cand *Candidate, pipeStats *PipelineStats) bool {
 		diversity++
 	}
 	if combinedSources.Has(SourceVirusTotalIP) {
+		diversity++
+	}
+	if combinedSources.Has(SourceChaos) {
 		diversity++
 	}
 	if diversity >= 2 {
@@ -2813,7 +3024,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 
 	if resumeStage == "" {
-		progressf("[*] STAGE A: Active certificate/SNI discovery (Direct TLS + resilient PTR + IP OSINT)...\n")
+		progressf("[*] STAGE A: Active certificate/SNI discovery (Direct TLS + resilient PTR + IP OSINT + Chaos Domain)...\n")
 		allPairs = make([]TargetPair, 0, len(sampledIPs))
 		ipOSINTLimit := cfg.IPOSINTLimit
 		if ipOSINTLimit <= 0 || ipOSINTLimit > len(sampledIPs) {
@@ -2826,6 +3037,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		for _, ip := range osintIPs[:ipOSINTLimit] {
 			ipOSINTAllowed[ip] = struct{}{}
 		}
+		pipeStats.mu.Lock()
+		pipeStats.IPOSINTIPsSelected = len(ipOSINTAllowed)
+		pipeStats.mu.Unlock()
 		for _, pairs := range discovery.Map(ctx, sampledIPs, minInt(cfg.Workers, len(sampledIPs)), func(jobCtx context.Context, ip string) []TargetPair {
 			_, allow := ipOSINTAllowed[ip]
 			return activeProbeIP(jobCtx, ip, time.Duration(cfg.TLSTimeoutMs)*time.Millisecond, pipeStats, rtCaches, cfg, allow)
@@ -2841,9 +3055,13 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			uniqueDomains[pair.SNI] = struct{}{}
 		}
 	}
-	progressf("[+] Stage A завершён. Уникальных SNI: %d | Пар IP+SNI: %d\n", len(uniqueDomains), len(allPairs))
+	progressf("[+] Stage A Direct/PTR/IP-OSINT завершён. Уникальных SNI: %d | Пар IP+SNI: %d\n", len(uniqueDomains), len(allPairs))
+	if strings.TrimSpace(cfg.ChaosKey) != "" {
+		allPairs = enrichWithChaosDomain(ctx, allPairs, cfg.ChaosKey, pipeStats)
+		progressf("[+] Chaos Domain enrichment: roots=%d | attempts=%d | success=%d | names=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames)
+	}
 	if cfg.Checkpoint != "" && resumeStage == "" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v91", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
 	}
 	if len(allPairs) == 0 {
 		activePTRStats(rtCaches, pipeStats)
@@ -2958,7 +3176,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	}
 	if cfg.Checkpoint != "" && resumeStage != "D" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v91", Stage: "D", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs, StageD: validPairs})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "D", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs, StageD: validPairs})
 	}
 	progressf("[*] STAGE E: Active HTTP/2 + TLS validation (%d targets)...\n", len(validPairs))
 	var candidates []Candidate
@@ -3204,6 +3422,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	progressf("[*] IP отобрано для пула:      %d\n", pipeStats.IPSampled)
 	progressf("[*] SNI/Domains discovered:    %d\n", len(uniqueDomains))
 	progressf("[*] PTR найдено:               %d | system=%d | DoH=%d\n", pipeStats.PTRFound, pipeStats.PTRSystemFallbacks, pipeStats.PTRDoHFallbacks)
+	progressf("[*] IP OSINT: IPs=%d | Shodan=%d/%d names=%d | VT=%d/%d names=%d | names-selected=%d\n", pipeStats.IPOSINTIPsSelected, pipeStats.IPOSINTShodanSuccess, pipeStats.IPOSINTShodanAttempts, pipeStats.IPOSINTShodanNames, pipeStats.IPOSINTVTSuccess, pipeStats.IPOSINTVTAttempts, pipeStats.IPOSINTVTNames, pipeStats.IPOSINTSelectedNames)
+	progressf("[*] Chaos Domain: roots=%d attempts=%d success=%d names=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames)
 	progressf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", pipeStats.DNSQueries, pipeStats.DNSSuccess, pipeStats.DNSFailed)
 	progressf("    DNS: Resolved=%d, NXDOMAIN=%d, NoIPv4=%d, Timeout=%d, RCODE=%d, Other=%d\n", pipeStats.DNSResolvedIPs, pipeStats.DNSNXDomain, pipeStats.DNSNoIPv4, pipeStats.DNSTimeout, pipeStats.DNSRCODEErrors, pipeStats.DNSOtherErr)
 	progressf("[*] DNS target matches:        %d | Valid pairs: %d\n", pipeStats.DNSTargetRangeMatches, pipeStats.DNSValidPairs)
@@ -3431,7 +3651,7 @@ func saveCheckpoint(path string, cp checkpointData) error {
 }
 
 func checkpointMatches(cp checkpointData, cfg Config, sampledIPs []string) bool {
-	if cp.Version != "v91" || cp.TargetIP != cfg.TargetIP || cp.TargetASN != cfg.TargetASN || cp.TargetCountry != cfg.TargetCountry {
+	if cp.Version != "v92" || cp.TargetIP != cfg.TargetIP || cp.TargetASN != cfg.TargetASN || cp.TargetCountry != cfg.TargetCountry {
 		return false
 	}
 	if len(cp.SampledIPs) != len(sampledIPs) {
@@ -3455,7 +3675,7 @@ func loadCheckpoint(path string) (checkpointData, error) {
 	if err := json.NewDecoder(f).Decode(&cp); err != nil {
 		return cp, err
 	}
-	if cp.Version != "v91" {
+	if cp.Version != "v92" {
 		return cp, fmt.Errorf("unsupported checkpoint version %q", cp.Version)
 	}
 	return cp, nil
@@ -3469,6 +3689,7 @@ func main() {
 		Workers:           30,
 		IPOSINTLimit:      256,
 		VTKey:             "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5",
+		ChaosKey:          "e3c91ed9-2f79-4147-807f-43dd150003e4",
 		MaxIPs:            LimitMaxIPs,
 		DNSWorkers:        32,
 		DNSQueryTimeoutMs: int(DNSQueryTimeoutDefault.Milliseconds()),
@@ -3583,7 +3804,7 @@ func main() {
 
 	results := RunPipeline(ctx, cfg, sampledIPs, scanRanges)
 	if cfg.Checkpoint != "" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v91", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
 	}
 	if len(results) == 0 {
 		progressln("\n[-] Подходящих Reality-feasible HTTP/2 целей не найдено.")
