@@ -154,6 +154,58 @@ var (
 	vtOSINTRate     = ratelimit.New(1)
 )
 
+type ProviderHTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *ProviderHTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("provider HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("provider HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+func providerImmediateBlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *ProviderHTTPError
+	if errors.As(err, &pe) {
+		return pe.StatusCode == http.StatusTooManyRequests || pe.StatusCode == http.StatusForbidden || pe.StatusCode >= 500
+	}
+	return true
+}
+
+type ProviderRunBreaker struct {
+	mu       sync.Mutex
+	disabled bool
+}
+
+func (b *ProviderRunBreaker) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !b.disabled
+}
+
+func (b *ProviderRunBreaker) Block() {
+	b.mu.Lock()
+	b.disabled = true
+	b.mu.Unlock()
+}
+
+func (b *ProviderRunBreaker) Reset() {
+	b.mu.Lock()
+	b.disabled = false
+	b.mu.Unlock()
+}
+
+var (
+	shodanRunBreaker ProviderRunBreaker
+	vtIPRunBreaker   ProviderRunBreaker
+	chaosRunBreaker  ProviderRunBreaker
+)
+
 type Config struct {
 	Workers           int
 	IPOSINTLimit      int
@@ -2408,6 +2460,9 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand
 }
 
 func fetchShodanInternetDB(ctx context.Context, ip string, timeout time.Duration) ([]string, error) {
+	if !shodanRunBreaker.Allow() {
+		return nil, errors.New("Shodan InternetDB disabled for run")
+	}
 	if err := shodanOSINTRate.Wait(ctx); err != nil {
 		return nil, err
 	}
@@ -2426,6 +2481,9 @@ func fetchShodanInternetDB(ctx context.Context, ip string, timeout time.Duration
 	req.Header.Set("User-Agent", "reality-scanner/1.0")
 	resp, err := ipOSINTHTTPClient.Do(req)
 	if err != nil {
+		if providerImmediateBlock(err) {
+			shodanRunBreaker.Block()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -2433,12 +2491,17 @@ func fetchShodanInternetDB(ctx context.Context, ip string, timeout time.Duration
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Shodan InternetDB HTTP %d", resp.StatusCode)
+		err := &ProviderHTTPError{StatusCode: resp.StatusCode}
+		if providerImmediateBlock(err) {
+			shodanRunBreaker.Block()
+		}
+		return nil, err
 	}
 	var payload struct {
 		Hostnames []string `json:"hostnames"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		shodanRunBreaker.Block()
 		return nil, err
 	}
 	out := make([]string, 0, len(payload.Hostnames))
@@ -2453,6 +2516,9 @@ func fetchShodanInternetDB(ctx context.Context, ip string, timeout time.Duration
 func fetchVirusTotalIPResolutions(ctx context.Context, ip, key string, timeout time.Duration) ([]string, error) {
 	if strings.TrimSpace(key) == "" {
 		return nil, nil
+	}
+	if !vtIPRunBreaker.Allow() {
+		return nil, errors.New("VirusTotal IP disabled for run")
 	}
 	if err := vtOSINTRate.Wait(ctx); err != nil {
 		return nil, err
@@ -2482,12 +2548,19 @@ func fetchVirusTotalIPResolutions(ctx context.Context, ip, key string, timeout t
 		req.Header.Set("x-apikey", key)
 		resp, err := ipOSINTHTTPClient.Do(req)
 		if err != nil {
+			if providerImmediateBlock(err) {
+				vtIPRunBreaker.Block()
+			}
 			return out, err
 		}
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			return out, fmt.Errorf("VirusTotal HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			err := &ProviderHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+			if providerImmediateBlock(err) {
+				vtIPRunBreaker.Block()
+			}
+			return out, err
 		}
 		var payload struct {
 			Data []struct {
@@ -2502,6 +2575,7 @@ func fetchVirusTotalIPResolutions(ctx context.Context, ip, key string, timeout t
 		err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
 		resp.Body.Close()
 		if err != nil {
+			vtIPRunBreaker.Block()
 			return out, err
 		}
 		for _, item := range payload.Data {
@@ -2604,6 +2678,9 @@ func fetchChaosDomain(ctx context.Context, root, key string, timeout time.Durati
 	if strings.TrimSpace(key) == "" {
 		return nil, nil
 	}
+	if !chaosRunBreaker.Allow() {
+		return nil, errors.New("Chaos disabled for run")
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://dns.projectdiscovery.io/dns/%s/subdomains", url.QueryEscape(root)), nil)
@@ -2614,17 +2691,25 @@ func fetchChaosDomain(ctx context.Context, root, key string, timeout time.Durati
 	req.Header.Set("Authorization", key)
 	resp, err := ipOSINTHTTPClient.Do(req)
 	if err != nil {
+		if providerImmediateBlock(err) {
+			chaosRunBreaker.Block()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("Chaos HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		err := &ProviderHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+		if providerImmediateBlock(err) {
+			chaosRunBreaker.Block()
+		}
+		return nil, err
 	}
 	var payload struct {
 		Subdomains []string `json:"subdomains"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+		chaosRunBreaker.Block()
 		return nil, err
 	}
 	out := make([]string, 0, len(payload.Subdomains))
@@ -3041,6 +3126,9 @@ func activePTRStats(rtCaches *RuntimeCaches, s *PipelineStats) {
 }
 
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange) []Candidate {
+	shodanRunBreaker.Reset()
+	vtIPRunBreaker.Reset()
+	chaosRunBreaker.Reset()
 	pipeStats := NewPipelineStats()
 	pipeStats.IPSampled = len(sampledIPs)
 	rtCaches := NewRuntimeCaches()
