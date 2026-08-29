@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sort"
@@ -42,6 +43,18 @@ type SNIResult struct {
 	SNI  []string `json:"sni"`
 	CN   []string `json:"certificate_cn,omitempty"`
 	Sans int      `json:"certificate_sans"`
+}
+
+func isPublicDomainSNI(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s, ".")))
+	if !isDomainSNI(s) {
+		return false
+	}
+	if strings.HasSuffix(s, ".local") || strings.HasSuffix(s, ".invalid") ||
+		s == "localhost" || strings.HasPrefix(s, "localhost.") {
+		return false
+	}
+	return true
 }
 
 func isDomainSNI(s string) bool {
@@ -78,6 +91,38 @@ func uniqueSorted(in []string) []string {
 		out = append(out, s)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func dnsResolvesToIP(ctx context.Context, host, targetIP string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return false
+	}
+	target := netip.MustParseAddr(targetIP)
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if ok && addr.Unmap() == target {
+			return true
+		}
+	}
+	return false
+}
+
+func fakeSNINames(ctx context.Context, ip string, names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range uniqueSorted(names) {
+		name = cleanDomain(name)
+		if !isPublicDomainSNI(name) {
+			continue
+		}
+		if dnsResolvesToIP(ctx, name, ip) {
+			continue
+		}
+		out = append(out, name)
+	}
 	return out
 }
 
@@ -219,9 +264,10 @@ func discoverSNI(ctx context.Context, ip string) *SNIResult {
 		return res
 	}
 	cert := st.PeerCertificates[0]
+	rawNames := append(append([]string{}, cert.DNSNames...), cert.Subject.CommonName)
 	res.CN = uniqueSorted([]string{cert.Subject.CommonName})
 	res.Sans = len(cert.DNSNames)
-	res.SNI = uniqueSorted(append(append([]string{}, cert.DNSNames...), cert.Subject.CommonName))
+	res.SNI = fakeSNINames(ctx, ip, rawNames)
 	return res
 }
 
