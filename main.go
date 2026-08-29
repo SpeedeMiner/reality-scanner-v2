@@ -1,13 +1,12 @@
 package main
 
-// reality-scanner-active-v92: modular active scanner
+// reality-scanner-active-sni: modular active scanner
 
 import (
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2291,38 +2290,24 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand
 		cand.ALPN = state.NegotiatedProtocol
 	}
 
-	if len(state.PeerCertificates) == 0 {
-		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("no peer certificates provided")}
+	// SNI mode deliberately does not validate the peer certificate.
+	// The TLS certificate is used only as optional metadata (issuer/expiry)
+	// when the peer provides one; certificate validity, chain and hostname
+	// matching are not gates for accepting an SNI candidate.
+	if len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		cand.CertIssuer = ""
+		if len(cert.Issuer.Organization) > 0 {
+			cand.CertIssuer = cert.Issuer.Organization[0]
+		}
+		if cand.CertIssuer == "" {
+			cand.CertIssuer = cert.Issuer.CommonName
+		}
+		cand.CertExpiry = cert.NotAfter
 	}
-
-	cert := state.PeerCertificates[0]
-	cand.CertIssuer = ""
-	if len(cert.Issuer.Organization) > 0 {
-		cand.CertIssuer = cert.Issuer.Organization[0]
-	}
-	if cand.CertIssuer == "" {
-		cand.CertIssuer = cert.Issuer.CommonName
-	}
-	now := time.Now()
-	cand.CertValidTime = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
-	cand.CertExpiry = cert.NotAfter
-
-	opts := x509.VerifyOptions{
-		DNSName:       sni,
-		Roots:         nil,
-		Intermediates: x509.NewCertPool(),
-	}
-	for _, c := range state.PeerCertificates[1:] {
-		opts.Intermediates.AddCert(c)
-	}
-
-	if _, err := cert.Verify(opts); err == nil {
-		cand.CertSNIMatch = true
-		cand.CertChainValid = true
-	} else {
-		cand.CertChainValid = false
-		cand.CertSNIMatch = (cert.VerifyHostname(sni) == nil)
-	}
+	cand.CertValidTime = false
+	cand.CertChainValid = false
+	cand.CertSNIMatch = false
 
 	br := bufio.NewReaderSize(uConn, MaxH2BufferedBytes)
 	fr := http2.NewFramer(uConn, br)
@@ -2502,7 +2487,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand
 		return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
 	}
 
-	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertChainValid && cand.CertValidTime
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2"
 
 	return cand, nil
 }
@@ -3044,6 +3029,9 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, pipeSt
 
 	pairs := make([]TargetPair, 0, len(sourceMap))
 	for d, src := range sourceMap {
+		if !isHostnameSNI(d) {
+			continue
+		}
 		pairs = append(pairs, TargetPair{IP: ip, SNI: d, Evidence: Evidence{Direct: src}})
 	}
 	sort.Slice(pairs, func(i, j int) bool {
@@ -3111,8 +3099,12 @@ func scoreH2Profile(c *Candidate) float64 {
 	return math.Min(score, 20.0)
 }
 
+func isHostnameSNI(s string) bool {
+	return s != "" && net.ParseIP(strings.TrimSpace(s)) == nil
+}
+
 func validateAndEnrich(cand *Candidate, pipeStats *PipelineStats) bool {
-	if cand == nil || !cand.H2ProtocolConfirmed || !cand.CertChainValid || !cand.CertSNIMatch || !cand.CertValidTime || !cand.TLS13 || cand.ALPN != "h2" {
+	if cand == nil || !cand.H2ProtocolConfirmed || !cand.TLS13 || cand.ALPN != "h2" {
 		return false
 	}
 
@@ -3268,7 +3260,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 
 	if resumeStage == "" {
-		progressf("[*] STAGE A: Active certificate/SNI discovery (Direct TLS + resilient PTR + IP OSINT + Chaos Domain)...\n")
+		progressf("[*] STAGE A: SNI discovery (certificate validation disabled)...\n")
 		allPairs = make([]TargetPair, 0, len(sampledIPs))
 		ipOSINTLimit := cfg.IPOSINTLimit
 		if ipOSINTLimit <= 0 || ipOSINTLimit > len(sampledIPs) {
@@ -3305,7 +3297,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		progressf("[+] Chaos Domain enrichment: roots=%d | attempts=%d | success=%d | raw-names=%d | selected-max=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames, ChaosMaxNames)
 	}
 	if cfg.Checkpoint != "" && resumeStage == "" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "sni", Stage: "A", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs})
 	}
 	if len(allPairs) == 0 {
 		activePTRStats(rtCaches, pipeStats)
@@ -3420,9 +3412,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	}
 	if cfg.Checkpoint != "" && resumeStage != "D" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "D", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs, StageD: validPairs})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "sni", Stage: "D", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, StageA: allPairs, StageD: validPairs})
 	}
-	progressf("[*] STAGE E: Active HTTP/2 + TLS validation (%d targets)...\n", len(validPairs))
+	progressf("[*] STAGE E: Active HTTP/2 + TLS validation (certificate checks disabled; hostname SNI only) (%d targets)...\n", len(validPairs))
 	var candidates []Candidate
 	workerCountE := scanning.WorkerCount(cfg.Workers, len(validPairs))
 	h2Jobs := make(chan TargetPair, len(validPairs))
@@ -3555,11 +3547,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					continue
 				}
 				pipeStats.H2StatusOK++
-				if !cand.CertChainValid || !cand.CertSNIMatch || !cand.CertValidTime {
-					pipeStats.TLSValidationFailures++
-					pipeStats.mu.Unlock()
-					continue
-				}
 				if cand.EndStreamSeen {
 					pipeStats.EndStreamOK++
 				}
@@ -3571,7 +3558,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					pipeStats.mu.Unlock()
 					continue
 				}
-				if !cand.RealityFeasible {
+				if !cand.RealityFeasible || !isHostnameSNI(cand.SNI) {
 					continue
 				}
 				pipeStats.mu.Lock()
@@ -3613,15 +3600,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		}
 		if a.Score != b.Score {
 			return a.Score > b.Score
-		}
-		if a.CertSNIMatch != b.CertSNIMatch {
-			return a.CertSNIMatch
-		}
-		if a.CertValidTime != b.CertValidTime {
-			return a.CertValidTime
-		}
-		if a.CertChainValid != b.CertChainValid {
-			return a.CertChainValid
 		}
 		if a.H2ProtocolConfirmed != b.H2ProtocolConfirmed {
 			return a.H2ProtocolConfirmed
@@ -3895,7 +3873,7 @@ func saveCheckpoint(path string, cp checkpointData) error {
 }
 
 func checkpointMatches(cp checkpointData, cfg Config, sampledIPs []string) bool {
-	if cp.Version != "v92" || cp.TargetIP != cfg.TargetIP || cp.TargetASN != cfg.TargetASN || cp.TargetCountry != cfg.TargetCountry {
+	if cp.Version != "sni" || cp.TargetIP != cfg.TargetIP || cp.TargetASN != cfg.TargetASN || cp.TargetCountry != cfg.TargetCountry {
 		return false
 	}
 	if len(cp.SampledIPs) != len(sampledIPs) {
@@ -3919,7 +3897,7 @@ func loadCheckpoint(path string) (checkpointData, error) {
 	if err := json.NewDecoder(f).Decode(&cp); err != nil {
 		return cp, err
 	}
-	if cp.Version != "v92" {
+	if cp.Version != "sni" {
 		return cp, fmt.Errorf("unsupported checkpoint version %q", cp.Version)
 	}
 	return cp, nil
@@ -4048,7 +4026,7 @@ func main() {
 
 	results := RunPipeline(ctx, cfg, sampledIPs, scanRanges)
 	if cfg.Checkpoint != "" {
-		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
+		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "sni", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
 	}
 	if len(results) == 0 {
 		progressln("\n[-] Подходящих Reality-feasible HTTP/2 целей не найдено.")
@@ -4080,6 +4058,6 @@ func main() {
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
-	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate issuer: %s | SNI match: %t | Chain: %t | Valid time: %t | Reality feasible: %t | RTT: %d ms\n", best.HTTPStatus, best.RealityScore.TLSQuality, best.CertIssuer, best.CertSNIMatch, best.CertChainValid, best.CertValidTime, best.RealityFeasible, best.Timings.TotalProbeLatency().Milliseconds())
+	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate issuer: %s | SNI mode: certificate checks disabled | RTT: %d ms\n", best.HTTPStatus, best.RealityScore.TLSQuality, best.CertIssuer, best.Timings.TotalProbeLatency().Milliseconds())
 	fmt.Printf("FINAL REALITY SCORE: %.1f/100\n", best.Score)
 }
