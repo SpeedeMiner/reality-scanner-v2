@@ -2999,7 +2999,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, pipeSt
 		}
 	}
 
-	// 2. Resilient PTR: system resolver в†’ raw resolver pool в†’ DoH inside resolvePTRRaw.
+	// 2. Resilient PTR: system resolver → raw resolver pool → DoH inside resolvePTRRaw.
 	names, err := resolvePTRRaw(ctx, ip, cfg.DNSResolvers, PTRQueryTimeoutDefault, rtCaches)
 	if err == nil && len(names) > 0 {
 		pipeStats.mu.Lock()
@@ -3299,7 +3299,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			uniqueDomains[pair.SNI] = struct{}{}
 		}
 	}
-	progressf("[+] Stage A Direct/PTR/IP-OSINT Р·Р°РІРµСЂС€С‘РЅ. РЈРЅРёРєР°Р»СЊРЅС‹С… SNI: %d | РџР°СЂ IP+SNI: %d\n", len(uniqueDomains), len(allPairs))
+	progressf("[+] Stage A Direct/PTR/IP-OSINT завершён. Уникальных SNI: %d | Пар IP+SNI: %d\n", len(uniqueDomains), len(allPairs))
 	if strings.TrimSpace(cfg.ChaosKey) != "" {
 		allPairs = enrichWithChaosDomain(ctx, allPairs, cfg.ChaosKey, pipeStats)
 		progressf("[+] Chaos Domain enrichment: roots=%d | attempts=%d | success=%d | raw-names=%d | selected-max=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames, ChaosMaxNames)
@@ -3398,7 +3398,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		close(jobsD)
 		wg.Wait()
 		if ctx.Err() != nil {
-			progressln("[-] Р’С‹РїРѕР»РЅРµРЅРёРµ РїСЂРµСЂРІР°РЅРѕ (Stage D).")
+			progressln("[-] Выполнение прервано (Stage D).")
 			return nil
 		}
 
@@ -3413,7 +3413,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		finalDNS := pipeStats.DNSValidPairs
 		finalASN := pipeStats.ASNFiltered
 		pipeStats.mu.Unlock()
-		progressf("[+] Stage D Р·Р°РІРµСЂС€С‘РЅ. РџРѕРґС‚РІРµСЂР¶РґРµРЅРѕ DNS-РїР°СЂ: %d | ASN filtered: %d\n", finalDNS, finalASN)
+		progressf("[+] Stage D завершён. Подтверждено DNS-пар: %d | ASN filtered: %d\n", finalDNS, finalASN)
 		if len(validPairs) == 0 {
 			return nil
 		}
@@ -3596,7 +3596,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		candidates = append(candidates, cand)
 	}
 	if ctx.Err() != nil {
-		progressln("[-] Р’С‹РїРѕР»РЅРµРЅРёРµ РїСЂРµСЂРІР°РЅРѕ (Stage E).")
+		progressln("[-] Выполнение прервано (Stage E).")
 		return nil
 	}
 
@@ -3661,14 +3661,14 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	pipeStats.mu.Lock()
 	progressln("\n===================================================================================================================")
-	progressln("                                   РўР•Р›Р•РњР•РўР РРЇ РђРљРўРР’РќРћР“Рћ РЎРљРђРќРР РћР’РђРќРРЇ")
+	progressln("                                   ТЕЛЕМЕТРИЯ АКТИВНОГО СКАНИРОВАНИЯ")
 	progressln("===================================================================================================================")
-	progressf("[*] IP РѕС‚РѕР±СЂР°РЅРѕ РґР»СЏ РїСѓР»Р°:      %d\n", pipeStats.IPSampled)
+	progressf("[*] IP отобрано для пула:      %d\n", pipeStats.IPSampled)
 	progressf("[*] SNI/Domains discovered:    %d\n", len(uniqueDomains))
-	progressf("[*] PTR РЅР°Р№РґРµРЅРѕ:               %d | system=%d | DoH=%d\n", pipeStats.PTRFound, pipeStats.PTRSystemFallbacks, pipeStats.PTRDoHFallbacks)
+	progressf("[*] PTR найдено:               %d | system=%d | DoH=%d\n", pipeStats.PTRFound, pipeStats.PTRSystemFallbacks, pipeStats.PTRDoHFallbacks)
 	progressf("[*] IP OSINT: IPs=%d | Shodan=%d/%d names=%d | VT=%d/%d names=%d | names-selected=%d\n", pipeStats.IPOSINTIPsSelected, pipeStats.IPOSINTShodanSuccess, pipeStats.IPOSINTShodanAttempts, pipeStats.IPOSINTShodanNames, pipeStats.IPOSINTVTSuccess, pipeStats.IPOSINTVTAttempts, pipeStats.IPOSINTVTNames, pipeStats.IPOSINTSelectedNames)
 	progressf("[*] Chaos Domain: roots=%d attempts=%d success=%d names=%d\n", pipeStats.ChaosRootsQueried, pipeStats.ChaosAttempts, pipeStats.ChaosSuccess, pipeStats.ChaosNames)
-	progressf("[*] Logical DNS Lookups:       %d (РЈСЃРїРµС…: %d, РћС€РёР±РѕРє: %d)\n", pipeStats.DNSQueries, pipeStats.DNSSuccess, pipeStats.DNSFailed)
+	progressf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", pipeStats.DNSQueries, pipeStats.DNSSuccess, pipeStats.DNSFailed)
 	progressf("    DNS: Resolved=%d, NXDOMAIN=%d, NoIPv4=%d, Timeout=%d, RCODE=%d, Other=%d\n", pipeStats.DNSResolvedIPs, pipeStats.DNSNXDomain, pipeStats.DNSNoIPv4, pipeStats.DNSTimeout, pipeStats.DNSRCODEErrors, pipeStats.DNSOtherErr)
 	progressf("[*] DNS target matches:        %d | Valid pairs: %d\n", pipeStats.DNSTargetRangeMatches, pipeStats.DNSValidPairs)
 	progressf("[*] TCP connected:              %d | timeout=%d refused=%d other=%d\n", pipeStats.TCPConnected, pipeStats.TCPTimeouts, pipeStats.TCPRefused, pipeStats.TCPOtherErrs)
@@ -3929,7 +3929,7 @@ func loadCheckpoint(path string) (checkpointData, error) {
 func resolveTargetIPv4(input string) (string, error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return "", fmt.Errorf("РїСѓСЃС‚РѕР№ Р°РґСЂРµСЃ")
+		return "", fmt.Errorf("пустой адрес")
 	}
 	if ip := net.ParseIP(input); ip != nil && ip.To4() != nil {
 		return ip.To4().String(), nil
@@ -3939,17 +3939,18 @@ func resolveTargetIPv4(input string) (string, error) {
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, input)
 	if err != nil {
-		return "", fmt.Errorf("РЅРµ СѓРґР°Р»РѕСЃСЊ СЂР°Р·СЂРµС€РёС‚СЊ %q: %w", input, err)
+		return "", fmt.Errorf("не удалось разрешить %q: %w", input, err)
 	}
 	for _, addr := range addrs {
 		if ip := addr.IP.To4(); ip != nil {
 			return ip.String(), nil
 		}
 	}
-	return "", fmt.Errorf("РґР»СЏ %q РЅРµ РЅР°Р№РґРµРЅ IPv4 Р°РґСЂРµСЃ", input)
+	return "", fmt.Errorf("для %q не найден IPv4 адрес", input)
 }
 
 func main() {
+	initWindowsConsoleUTF8()
 	uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	cfg := Config{
@@ -3971,7 +3972,7 @@ func main() {
 
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
 	flag.IntVar(&cfg.IPOSINTLimit, "ip-osint-limit", 256, "Maximum sampled IPs for IP OSINT")
-	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP VPS РґР»СЏ РѕРїСЂРµРґРµР»РµРЅРёСЏ ASN, СЃС‚СЂР°РЅС‹ Рё ECS")
+	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP VPS для определения ASN, страны и ECS")
 	flag.Float64Var(&cfg.Rate, "rate", 0, "New TCP/TLS probe rate per second; 0=unlimited")
 	flag.BoolVar(&cfg.JSON, "json", false, "Emit JSON Lines instead of the text table")
 	flag.StringVar(&cfg.Checkpoint, "checkpoint", "", "Checkpoint file")
@@ -3985,15 +3986,15 @@ func main() {
 		fmt.Println("                 REALITY SCANNER v98 GUI")
 		fmt.Println("============================================================")
 		fmt.Println()
-		fmt.Println("Р’РІРµРґРёС‚Рµ IPv4 Р°РґСЂРµСЃ РёР»Рё РґРѕРјРµРЅ VPS Рё РЅР°Р¶РјРёС‚Рµ Enter.")
-		fmt.Println("Р”РѕРјРµРЅ Р±СѓРґРµС‚ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё СЂР°Р·СЂРµС€С‘РЅ РІ IPv4.")
+		fmt.Println("Введите IPv4 адрес или домен VPS и нажмите Enter.")
+		fmt.Println("Домен будет автоматически разрешён в IPv4.")
 		fmt.Println("Workers: 256 | DNS workers: 64")
 		fmt.Println()
-		fmt.Print("VPS IP/РґРѕРјРµРЅ: ")
+		fmt.Print("VPS IP/домен: ")
 		reader := bufio.NewReader(os.Stdin)
 		ip, err := reader.ReadString('\n')
 		if err != nil && len(strings.TrimSpace(ip)) == 0 {
-			log.Fatalf("[-] РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРѕС‡РёС‚Р°С‚СЊ IP Р°РґСЂРµСЃ: %v", err)
+			log.Fatalf("[-] Не удалось прочитать IP адрес: %v", err)
 		}
 		cfg.TargetIP = strings.TrimSpace(ip)
 		cfg.Workers = 256
@@ -4029,7 +4030,7 @@ func main() {
 
 	cfg.TargetASN = getASN(cfg.TargetIP)
 	if cfg.TargetASN == "UNKNOWN_ASN" {
-		log.Fatalf("[-] РќРµ СѓРґР°Р»РѕСЃСЊ РѕРїСЂРµРґРµР»РёС‚СЊ ASN РґР»СЏ %s", cfg.TargetIP)
+		log.Fatalf("[-] Не удалось определить ASN для %s", cfg.TargetIP)
 	}
 	var startupWG sync.WaitGroup
 	startupWG.Add(2)
@@ -4040,12 +4041,12 @@ func main() {
 	startupWG.Wait()
 	cfg.TargetCountry = startupCountry
 	if len(cidrs) == 0 {
-		log.Fatalf("[-] РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ announced prefixes РґР»СЏ %s", cfg.TargetASN)
+		log.Fatalf("[-] Не удалось получить announced prefixes для %s", cfg.TargetASN)
 	}
 
 	parsedIP := net.ParseIP(cfg.TargetIP)
 	if parsedIP == nil {
-		log.Fatalf("[-] РќРµРєРѕСЂСЂРµРєС‚РЅС‹Р№ С†РµР»РµРІРѕР№ IPv4: %s", cfg.TargetIP)
+		log.Fatalf("[-] Некорректный целевой IPv4: %s", cfg.TargetIP)
 	}
 
 	localPrefix := ""
@@ -4057,7 +4058,7 @@ func main() {
 		}
 	}
 	if localPrefix == "" {
-		log.Fatalf("[-] VPS IP %s РЅРµ РІС…РѕРґРёС‚ РІ announced prefixes %s", cfg.TargetIP, cfg.TargetASN)
+		log.Fatalf("[-] VPS IP %s не входит в announced prefixes %s", cfg.TargetIP, cfg.TargetASN)
 	}
 
 	samplingCIDRs := cidrs
@@ -4076,7 +4077,7 @@ func main() {
 				samplingCIDRs = append([]string{localPrefix}, samplingCIDRs...)
 			}
 		} else {
-			progressf("[!] Country filter %s РЅРµ РґР°Р» prefixes; СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РѕСЃС‚Р°С‘С‚СЃСЏ РїРѕ ASN.\n", cfg.TargetCountry)
+			progressf("[!] Country filter %s не дал prefixes; сканирование остаётся по ASN.\n", cfg.TargetCountry)
 		}
 	}
 
@@ -4084,15 +4085,15 @@ func main() {
 	sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
 	scanRanges := MergeCIDRs(cidrs)
 	if len(sampledIPs) == 0 {
-		log.Fatalf("[-] РџСѓР» IP РїСѓСЃС‚")
+		log.Fatalf("[-] Пул IP пуст")
 	}
 
-	progressf("[*] Р¦РµР»РµРІРѕР№ VPS IP:          %s\n", cfg.TargetIP)
+	progressf("[*] Целевой VPS IP:          %s\n", cfg.TargetIP)
 	progressf("[*] Announcing ASN:         %s\n", cfg.TargetASN)
-	progressf("[*] РЎС‚СЂР°РЅР° СЃРµСЂРІРµСЂР°:          %s\n", cfg.TargetCountry)
-	progressf("[*] Р¤РѕРєСѓСЃ sampling:          %d prefixes\n", len(samplingCIDRs))
-	progressf("[*] РџРѕР»РЅС‹Р№ ASN РґР»СЏ DNS match: %d prefixes\n", len(cidrs))
-	progressf("[*] IP РІ Р°РєС‚РёРІРЅРѕРј РїСѓР»Рµ:       %d\n", len(sampledIPs))
+	progressf("[*] Страна сервера:          %s\n", cfg.TargetCountry)
+	progressf("[*] Фокус sampling:          %d prefixes\n", len(samplingCIDRs))
+	progressf("[*] Полный ASN для DNS match: %d prefixes\n", len(cidrs))
+	progressf("[*] IP в активном пуле:       %d\n", len(sampledIPs))
 	progressf("[*] Workers:                  %d | DNS workers: %d | Rate: %.0f/s\n", cfg.Workers, cfg.DNSWorkers, cfg.Rate)
 	progressf("[*] ECS client IP:             %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
 	progressf("[*] DNS pool:                  %d resolvers\n\n", len(cfg.DNSResolvers))
@@ -4102,7 +4103,7 @@ func main() {
 		_ = saveCheckpoint(cfg.Checkpoint, checkpointData{Version: "v92", Stage: "E", TargetIP: cfg.TargetIP, TargetASN: cfg.TargetASN, TargetCountry: cfg.TargetCountry, SampledIPs: sampledIPs, Final: results})
 	}
 	if len(results) == 0 {
-		progressln("\n[-] РџРѕРґС…РѕРґСЏС‰РёС… Reality-feasible HTTP/2 С†РµР»РµР№ РЅРµ РЅР°Р№РґРµРЅРѕ.")
+		progressln("\n[-] Подходящих Reality-feasible HTTP/2 целей не найдено.")
 		return
 	}
 
@@ -4113,8 +4114,8 @@ func main() {
 		return
 	}
 
-	fmt.Printf("\n[+] РќР°Р№РґРµРЅРѕ РІР°Р»РёРґРЅС‹С… HTTP/2 С†РµР»РµР№ РїРѕСЃР»Рµ РєР»Р°СЃС‚РµСЂРёР·Р°С†РёРё: %d\n\n", len(results))
-	fmt.Printf("%-32.32s | %-15.15s | %-6s | %-30.30s | %4s\n", "Р¦РµР»СЊ (SNI)", "IP Р°РґСЂРµСЃ", "STATUS", "certificate issuer", "RTT")
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей после кластеризации: %d\n\n", len(results))
+	fmt.Printf("%-32.32s | %-15.15s | %-6s | %-30.30s | %4s\n", "Цель (SNI)", "IP адрес", "STATUS", "certificate issuer", "RTT")
 	fmt.Println(strings.Repeat("-", 101))
 	for _, r := range results {
 		issuer := r.CertIssuer
@@ -4127,7 +4128,7 @@ func main() {
 
 	best := results[0]
 	progressln("\n===================================================================================================================")
-	fmt.Println("                                   Р Р•РљРћРњР•РќР”РЈР•РњРђРЇ РљРћРќР¤РР“РЈР РђР¦РРЇ DEST/SNI")
+	fmt.Println("                                   РЕКОМЕНДУЕМАЯ КОНФИГУРАЦИЯ DEST/SNI")
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
