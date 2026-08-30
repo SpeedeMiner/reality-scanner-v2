@@ -3926,6 +3926,29 @@ func loadCheckpoint(path string) (checkpointData, error) {
 }
 
 // ================= MAIN =================
+func resolveTargetIPv4(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", fmt.Errorf("пустой адрес")
+	}
+	if ip := net.ParseIP(input); ip != nil && ip.To4() != nil {
+		return ip.To4().String(), nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, input)
+	if err != nil {
+		return "", fmt.Errorf("не удалось разрешить %q: %w", input, err)
+	}
+	for _, addr := range addrs {
+		if ip := addr.IP.To4(); ip != nil {
+			return ip.String(), nil
+		}
+	}
+	return "", fmt.Errorf("для %q не найден IPv4 адрес", input)
+}
+
 func main() {
 	uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -3962,10 +3985,11 @@ func main() {
 		fmt.Println("                 REALITY SCANNER v98 GUI")
 		fmt.Println("============================================================")
 		fmt.Println()
-		fmt.Println("Введите IPv4 адрес VPS и нажмите Enter.")
+		fmt.Println("Введите IPv4 адрес или домен VPS и нажмите Enter.")
+		fmt.Println("Домен будет автоматически разрешён в IPv4.")
 		fmt.Println("Workers: 256 | DNS workers: 64")
 		fmt.Println()
-		fmt.Print("VPS IP: ")
+		fmt.Print("VPS IP/домен: ")
 		reader := bufio.NewReader(os.Stdin)
 		ip, err := reader.ReadString('\n')
 		if err != nil && len(strings.TrimSpace(ip)) == 0 {
@@ -3993,11 +4017,11 @@ func main() {
 	}
 	probeLimiter = ratelimit.New(cfg.Rate)
 
-	parsedIP := net.ParseIP(strings.TrimSpace(cfg.TargetIP))
-	if parsedIP == nil || parsedIP.To4() == nil {
-		log.Fatalf("[-] Нужен корректный IPv4 через -vps-ip")
+	resolvedIP, err := resolveTargetIPv4(cfg.TargetIP)
+	if err != nil {
+		log.Fatalf("[-] %v", err)
 	}
-	cfg.TargetIP = parsedIP.To4().String()
+	cfg.TargetIP = resolvedIP
 	cfg.ECSIP = cfg.TargetIP
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
