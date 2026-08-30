@@ -3953,7 +3953,29 @@ func main() {
 	flag.BoolVar(&cfg.JSON, "json", false, "Emit JSON Lines instead of the text table")
 	flag.StringVar(&cfg.Checkpoint, "checkpoint", "", "Checkpoint file")
 	flag.BoolVar(&cfg.Resume, "resume", false, "Resume final results from checkpoint")
-	flag.Parse()
+
+	// Simple interactive CMD-style mode: double-click / run without arguments
+	// and ask only for the VPS IPv4. All other settings keep safe defaults.
+	interactive := len(os.Args) == 1
+	if interactive {
+		fmt.Println("============================================================")
+		fmt.Println("                 REALITY SCANNER v98 GUI")
+		fmt.Println("============================================================")
+		fmt.Println()
+		fmt.Println("Введите IPv4 адрес VPS и нажмите Enter.")
+		fmt.Println("Workers: 256 | DNS workers: 64")
+		fmt.Println()
+		fmt.Print("VPS IP: ")
+		reader := bufio.NewReader(os.Stdin)
+		ip, err := reader.ReadString('\n')
+		if err != nil && len(strings.TrimSpace(ip)) == 0 {
+			log.Fatalf("[-] Не удалось прочитать IP адрес: %v", err)
+		}
+		cfg.TargetIP = strings.TrimSpace(ip)
+		cfg.Workers = 256
+	} else {
+		flag.Parse()
+	}
 	progressJSON = cfg.JSON
 
 	if cfg.Workers < 1 {
