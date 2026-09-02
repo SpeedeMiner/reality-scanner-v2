@@ -1,4 +1,4 @@
-// reality-scanner-sni-v5
+// reality-scanner-sni-v6
 package main
 
 import (
@@ -340,6 +340,19 @@ func isDomainSNI(s string) bool {
 
 func cleanDomain(s string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s, ".")))
+}
+
+func uniqueStrings(in []string) []string {
+	set := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := set[s]; ok {
+			continue
+		}
+		set[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func uniqueSorted(in []string) []string {
