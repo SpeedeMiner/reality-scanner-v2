@@ -1,4 +1,4 @@
-// reality-scanner-sni-v6
+// reality-scanner-sni-v7
 package main
 
 import (
@@ -807,7 +807,7 @@ func incIPv4(ip net.IP) {
 func discoverSNI(ctx context.Context, ip string, resolvers []string, pool *DNSPool) *SNIResult {
 	res := &SNIResult{IP: ip}
 	d := &net.Dialer{Timeout: tlsTimeout}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "8443"))
 	if err != nil {
 		return res
 	}
